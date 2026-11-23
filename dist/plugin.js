@@ -2,7 +2,7 @@ exports.version = 1.2
 exports.apiRequired = 8.85
 exports.hasConfig = true
 exports.description = "JSON DB (Multiple Databases, Auto Backup, Password Protection, Admin API Hints + Log Hints)"
-exports.repo = "Hug3O/Json-db"
+exports.repo = "hugo529100/hfs-Json-db"
 
 exports.config = {
 
