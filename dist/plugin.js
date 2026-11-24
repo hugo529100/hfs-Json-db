@@ -1,7 +1,7 @@
-exports.version = 1.2
+exports.version = 1.3
 exports.apiRequired = 8.85
 exports.hasConfig = true
-exports.description = "JSON DB (Multiple Databases, Auto Backup, Password Protection, Admin API Hints + Log Hints)"
+exports.description = "JSON DB (Multiple Databases, Auto Backup, Password Protection, Admin API Hints + Log Hints, POST body support, Batch write)"
 exports.repo = "hugo529100/hfs-Json-db"
 
 exports.config = {
@@ -22,9 +22,17 @@ Get data:
 
 Set data:
 /~/api/jsondb/set?db=DBNAME&key=KEY&value=VALUE
+POST /~/api/jsondb/set   {"db":"DBNAME","key":"KEY","value":...}
+(values that are valid JSON are stored as JSON, everything else as string)
+
+Set many keys in one request (single file write):
+/~/api/jsondb/mset?db=DBNAME&items=[{"key":"a","value":1},{"key":"b","value":2}]
 
 Delete data:
 /~/api/jsondb/del?db=DBNAME&key=KEY
+
+List keys:
+/~/api/jsondb/keys?db=DBNAME&prefix=optional
 
 Export entire database:
 /~/api/jsondb/dump?db=DBNAME
@@ -34,6 +42,13 @@ List all databases:
 
 If API requires credentials, append:
 &user=USERNAME&pass=PASSWORD
+(or use HTTP Basic authentication)
+
+Tips:
+* POST body accepts JSON or form-urlencoded. A "text/plain" JSON body avoids
+  the CORS preflight, which is handy for browser pages.
+* GET URLs are limited by the HTTP server (~32KB). Use POST or mset for
+  bigger payloads.
         `
     },
 
@@ -41,7 +56,7 @@ If API requires credentials, append:
         type: 'boolean',
         label: 'Enable API Username/Password Protection',
         defaultValue: false,
-        helperText: "If enabled, all APIs require ?user=xxx&pass=xxx"
+        helperText: "If enabled, all APIs require ?user=xxx&pass=xxx (or HTTP Basic auth)"
     },
 
     apiUser: {
@@ -53,6 +68,20 @@ If API requires credentials, append:
         type: 'password',
         label: 'API Password',
         defaultValue: ''
+    },
+
+    maxValueBytes: {
+        type: 'number',
+        label: 'Max size of a single value (bytes)',
+        defaultValue: 8388608,
+        helperText: 'Larger values are rejected with a clear error (0 = no limit). Prevents memory blow-ups.'
+    },
+
+    allowClearAll: {
+        type: 'boolean',
+        label: 'Allow "del" without key to wipe the whole database',
+        defaultValue: false,
+        helperText: 'When disabled, del without key returns an error unless confirm=clear is passed.'
     },
 
     backupInterval: {
@@ -86,6 +115,8 @@ exports.init = async api => {
     const DB = {}
     const mutex = {}
     const backupTimers = {}
+    const lastBackupStamp = {}
+    const MAX_BODY_BYTES = 32 * 1024 * 1024
 
     const fullPath = fn => path.join(storage, fn)
 
@@ -132,47 +163,43 @@ exports.init = async api => {
         await fs.rename(tmp, fp)
     }
 
-    // ------ 獲取最新備份文件 ------
-    async function getLatestBackupFile(entry) {
+    // ------ 獲取所有備份文件（新的在前） ------
+    async function listBackupFiles(entry) {
         const { filename } = entry
         const baseName = filename.replace('.json', '')
         const files = await fs.readdir(storage)
-        const backupFiles = files.filter(f => 
-            f.startsWith(baseName + '_') && f.endsWith('.bak')
-        )
-        
-        if (backupFiles.length === 0) return null
-        
-        // 按文件名排序（時間戳格式自然排序，最新的在最後）
-        backupFiles.sort()
-        
-        // 返回最新的備份文件
-        return backupFiles[backupFiles.length - 1]
+        return files
+            .filter(f => f.startsWith(baseName + '_') && f.endsWith('.bak'))
+            .sort()
+            .reverse()
+    }
+
+    // ------ 獲取最新備份文件 ------
+    async function getLatestBackupFile(entry) {
+        const files = await listBackupFiles(entry)
+        return files.length ? files[0] : null
     }
 
     // ------ 創建時間戳備份 ------
-    async function createTimestampBackup(entry) {
+    async function createTimestampBackup(entry, { force = false } = {}) {
         try {
             const { name, filename } = entry
             const fp = fullPath(filename)
-            
-            // 讀取當前文件內容
-            const txt = await fs.readFile(fp, 'utf8')
             const timestamp = getTimestamp()
-            
-            // 創建備份文件名 (filename_YYYYMMDD_HHMM.bak)
+
+            // 同一分鐘內只備份一次（避免啟動/設定變更時重複產生相同備份）
+            if (!force && lastBackupStamp[name] === timestamp) {
+                return
+            }
+            lastBackupStamp[name] = timestamp
+
+            const txt = await fs.readFile(fp, 'utf8')
             const baseName = filename.replace('.json', '')
             const backupName = `${baseName}_${timestamp}.bak`
-            const backupPath = fullPath(backupName)
-            
-            // 寫入備份文件
-            await fs.writeFile(backupPath, txt)
-            
+            await fs.writeFile(fullPath(backupName), txt)
+
             debugLog(`created timestamped backup for ${filename} -> ${backupName}`)
-            
-            // 清理舊備份
             await cleanupOldBackups(entry)
-            
         } catch (error) {
             errorLog(`backup failed for ${entry.filename}`, error)
         }
@@ -181,24 +208,15 @@ exports.init = async api => {
     // ------ 清理舊備份 ------
     async function cleanupOldBackups(entry) {
         try {
-            const { filename } = entry
             const retentionDays = api.getConfig('backupRetentionDays') || 3
             const cutoffTime = Date.now() - (retentionDays * 24 * 60 * 60 * 1000)
-            
-            const baseName = filename.replace('.json', '')
-            const files = await fs.readdir(storage)
-            const backupFiles = files.filter(f => 
-                f.startsWith(baseName + '_') && f.endsWith('.bak')
-            )
-            
-            if (backupFiles.length === 0) return
-            
+            const files = await listBackupFiles(entry)
+
             let cleanedCount = 0
-            // 獲取文件創建時間
-            for (const backupFile of backupFiles) {
+            for (const backupFile of files) {
                 try {
                     const stat = await fs.stat(fullPath(backupFile))
-                    if (stat.ctime.getTime() < cutoffTime) {
+                    if (stat.mtime.getTime() < cutoffTime) {
                         await fs.unlink(fullPath(backupFile))
                         cleanedCount++
                         debugLog(`cleaned old backup ${backupFile}`)
@@ -207,11 +225,10 @@ exports.init = async api => {
                     debugLog(`failed to process backup ${backupFile}`, error)
                 }
             }
-            
+
             if (cleanedCount > 0) {
-                debugLog(`cleaned ${cleanedCount} old backups for ${filename}`)
+                debugLog(`cleaned ${cleanedCount} old backups for ${entry.filename}`)
             }
-            
         } catch (error) {
             errorLog(`backup cleanup failed for ${entry.filename}`, error)
         }
@@ -220,15 +237,11 @@ exports.init = async api => {
     // ------ 清理舊的簡單備份文件（兼容性清理） ------
     async function cleanupLegacyBackupFiles(entry) {
         try {
-            const { filename } = entry
-            const legacyBackup = fullPath(filename + ".bak")
-            
-            // 檢查是否存在舊的簡單備份文件
+            const legacyBackup = fullPath(entry.filename + ".bak")
             try {
                 await fs.stat(legacyBackup)
-                // 如果存在，刪除它
                 await fs.unlink(legacyBackup)
-                debugLog(`removed legacy backup file ${filename}.bak`)
+                debugLog(`removed legacy backup file ${entry.filename}.bak`)
             } catch (error) {
                 // 文件不存在，忽略
             }
@@ -239,10 +252,9 @@ exports.init = async api => {
 
     // ------ 設置定時備份 ------
     function setupBackupTimer(entry) {
-        const interval = api.getConfig('backupInterval') || 12
-        
+        const interval = api.getConfig('backupInterval') || 0
+
         if (interval <= 0) {
-            // 禁用定時備份
             if (backupTimers[entry.name]) {
                 clearInterval(backupTimers[entry.name])
                 delete backupTimers[entry.name]
@@ -250,70 +262,78 @@ exports.init = async api => {
             }
             return
         }
-        
-        // 清理現有定時器
+
         if (backupTimers[entry.name]) {
             clearInterval(backupTimers[entry.name])
             debugLog(`updated backup timer for ${entry.filename}`)
         } else {
             debugLog(`enabled auto backup for ${entry.filename}`)
         }
-        
-        // 設置新的定時器（小時轉毫秒）
+
         const intervalMs = interval * 60 * 60 * 1000
         backupTimers[entry.name] = setInterval(() => {
             createTimestampBackup(entry)
         }, intervalMs)
-        
+        if (backupTimers[entry.name].unref) backupTimers[entry.name].unref()
+
         debugLog(`scheduled backup for ${entry.filename} every ${interval} hours`)
-        
-        // 立即執行第一次備份
-        setTimeout(() => createTimestampBackup(entry), 1000)
+
+        // 第一次備份（延遲避免拖慢啟動；同一分鐘內自動去重）
+        setTimeout(() => createTimestampBackup(entry), 2000)
     }
 
     // ------ LOAD DB ------
     async function loadDB(entry) {
         const { name, filename } = entry
         const fp = fullPath(filename)
-        
-        // 首先清理舊的簡單備份文件
         await cleanupLegacyBackupFiles(entry)
 
+        let txt = null
+        let parseError = null
         try {
-            // 嘗試直接讀取主文件
-            const txt = await fs.readFile(fp, 'utf8')
+            txt = await fs.readFile(fp, 'utf8')
             DB[name] = { data: JSON.parse(txt), filename }
             setupBackupTimer(entry)
-            
-            // 創建初始備份
-            setTimeout(() => createTimestampBackup(entry), 2000)
             return
-        } catch {}
-
-        try {
-            // 嘗試從最新的時間戳備份恢復
-            const latestBackup = await getLatestBackupFile(entry)
-            if (latestBackup) {
-                const txt = await fs.readFile(fullPath(latestBackup), 'utf8')
-                await safeWrite(fp, txt)
-                DB[name] = { data: JSON.parse(txt), filename }
-                infoLog(`restored ${filename} from timestamped backup ${latestBackup}`)
-                setupBackupTimer(entry)
-                return
+        } catch (e) {
+            parseError = e
+            if (txt !== null) {
+                errorLog(`main file ${filename} is not valid JSON: ${e.message}`)
             }
-        } catch (error) {
-            debugLog(`failed to restore from backup for ${filename}`, error)
         }
 
-        // 創建新數據庫
+        // 主文件不存在或損壞：依序嘗試所有備份（新 -> 舊）
+        const backups = await listBackupFiles(entry).catch(() => [])
+        for (const backupName of backups) {
+            try {
+                const txt2 = await fs.readFile(fullPath(backupName), 'utf8')
+                const data = JSON.parse(txt2)
+                // 先把損壞的主文件留下來，再從備份還原
+                if (txt !== null) {
+                    const broken = `${filename}.corrupt-${getTimestamp()}`
+                    await fs.writeFile(fullPath(broken), txt).catch(() => {})
+                    errorLog(`kept broken file as ${broken}`)
+                }
+                await safeWrite(fp, txt2)
+                DB[name] = { data, filename }
+                infoLog(`restored ${filename} from backup ${backupName}`)
+                setupBackupTimer(entry)
+                return
+            } catch (e) {
+                debugLog(`backup ${backupName} unusable: ${e.message}`)
+            }
+        }
+
+        // 完全沒有可用資料：建立新庫（若主文件存在但損壞，上面已另存副本）
+        if (txt !== null) {
+            const broken = `${filename}.corrupt-${getTimestamp()}`
+            await fs.writeFile(fullPath(broken), txt).catch(() => {})
+            errorLog(`no usable backup for ${filename}, kept broken file as ${broken}`)
+        }
         const empty = {}
-        const txt = JSON.stringify(empty, null, 2)
-        await safeWrite(fp, txt)
+        await safeWrite(fp, JSON.stringify(empty, null, 2))
         DB[name] = { data: empty, filename }
-        infoLog(`created new database ${filename}`)
-        
-        // 創建初始時間戳備份
-        setTimeout(() => createTimestampBackup(entry), 2000)
+        infoLog(`created new database ${filename}${parseError ? ' (previous file was unusable)' : ''}`)
         setupBackupTimer(entry)
     }
 
@@ -336,37 +356,113 @@ exports.init = async api => {
     }
 
     await loadAll()
-    
-    // 監聽配置變化
+
+    // 監聯配置變化
     api.subscribeConfig(["dbList", "backupInterval", "debugMode"], async () => {
-        // 重新加載所有數據庫並更新定時器
         const list = api.getConfig("dbList") || []
         for (const x of list) {
             if (!DB[x.name]) {
                 await loadDB(x)
             } else {
-                // 更新現有數據庫的備份定時器
                 setupBackupTimer(x)
             }
         }
     })
 
+    // ------ 請求參數：query + POST body + Basic auth ------
+    function parseBodyText(raw, contentType = '') {
+        const text = String(raw || '').trim()
+        if (!text) return {}
+        if (contentType.includes('application/x-www-form-urlencoded')) {
+            const out = {}
+            for (const [k, v] of new URLSearchParams(text)) out[k] = v
+            return out
+        }
+        try {
+            const parsed = JSON.parse(text)
+            return parsed && typeof parsed === 'object' ? parsed : {}
+        } catch {}
+        const out = {}
+        try {
+            for (const [k, v] of new URLSearchParams(text)) out[k] = v
+        } catch {}
+        return out
+    }
+
+    function readBody(req, limit = MAX_BODY_BYTES) {
+        return new Promise(resolve => {
+            if (!req || req.readableEnded || req.complete) return resolve('')
+            let size = 0
+            let done = false
+            const chunks = []
+            const finish = txt => {
+                if (done) return
+                done = true
+                clearTimeout(timer)
+                resolve(txt)
+            }
+            const timer = setTimeout(() => finish(''), 5000)
+            req.on('data', c => {
+                size += c.length
+                if (size > limit) {
+                    try { req.destroy() } catch {}
+                    return finish('')
+                }
+                chunks.push(c)
+            })
+            req.on('end', () => finish(Buffer.concat(chunks).toString('utf8')))
+            req.on('error', () => finish(''))
+        })
+    }
+
+    async function getParams(ctx) {
+        const params = { ...(ctx.query || {}) }
+
+        if (ctx.method === 'POST' || ctx.method === 'PUT' || ctx.method === 'PATCH') {
+            // HFS 可能已經解析過 body
+            const pre = (ctx.request && ctx.request.body) || (ctx.state && ctx.state.params)
+            if (pre && typeof pre === 'object') {
+                Object.assign(params, pre)
+            } else {
+                const raw = await readBody(ctx.req)
+                if (raw) Object.assign(params, parseBodyText(raw, ctx.get('content-type') || ''))
+            }
+        }
+
+        // HTTP Basic 認證（避免密碼出現在網址與紀錄中）
+        if (params.user === undefined || params.pass === undefined) {
+            const m = /^Basic\s+(.+)$/i.exec(ctx.get('authorization') || '')
+            if (m) {
+                try {
+                    const decoded = Buffer.from(m[1], 'base64').toString('utf8')
+                    const idx = decoded.indexOf(':')
+                    const u = idx >= 0 ? decoded.slice(0, idx) : decoded
+                    const p = idx >= 0 ? decoded.slice(idx + 1) : ''
+                    if (params.user === undefined) params.user = u
+                    if (params.pass === undefined) params.pass = p
+                } catch {}
+            }
+        }
+
+        return params
+    }
+
     // ------ 手動備份 API ------
-    async function manualBackup(ctx) {
-        const db = ctx.query.db
+    async function manualBackup(ctx, params) {
+        const db = params.db
         if (!db || !DB[db]) {
             ctx.body = { ok: false, error: "db not found" }
             return
         }
-        
+
         const entry = api.getConfig("dbList").find(d => d.name === db)
         if (!entry) {
             ctx.body = { ok: false, error: "db entry not found" }
             return
         }
-        
+
         try {
-            await createTimestampBackup(entry)
+            await createTimestampBackup(entry, { force: true })
             ctx.body = { ok: true, message: "Backup created successfully" }
         } catch (error) {
             ctx.body = { ok: false, error: "Backup failed" }
@@ -374,29 +470,22 @@ exports.init = async api => {
     }
 
     // ------ 列出備份文件 API ------
-    async function listBackups(ctx) {
-        const db = ctx.query.db
+    async function listBackups(ctx, params) {
+        const db = params.db
         if (!db) {
             ctx.body = { ok: false, error: "db parameter required" }
             return
         }
-        
+
         const entry = api.getConfig("dbList").find(d => d.name === db)
         if (!entry) {
             ctx.body = { ok: false, error: "db not found" }
             return
         }
-        
+
         try {
-            const { filename } = entry
-            const baseName = filename.replace('.json', '')
-            const files = await fs.readdir(storage)
-            const backupFiles = files.filter(f => 
-                f.startsWith(baseName + '_') && f.endsWith('.bak')
-            )
-            
             const filesWithStats = await Promise.all(
-                backupFiles.map(async f => {
+                (await listBackupFiles(entry)).map(async f => {
                     const stat = await fs.stat(fullPath(f))
                     return {
                         name: f,
@@ -407,15 +496,8 @@ exports.init = async api => {
                     }
                 })
             )
-            
-            // 按創建時間排序（新的在前）
-            filesWithStats.sort((a, b) => b.created - a.created)
-            
-            ctx.body = { 
-                ok: true, 
-                backups: filesWithStats,
-                count: filesWithStats.length
-            }
+            filesWithStats.sort((a, b) => b.modified - a.modified)
+            ctx.body = { ok: true, backups: filesWithStats, count: filesWithStats.length }
         } catch (error) {
             ctx.body = { ok: false, error: "Failed to list backups" }
         }
@@ -432,11 +514,38 @@ exports.init = async api => {
     }
 
     // ------ AUTH CHECK ------
-    function checkAuth(ctx) {
+    function checkAuth(params) {
         if (!api.getConfig('apiAuthEnabled')) return true
-        const u = ctx.query.user || ""
-        const p = ctx.query.pass || ""
+        const u = params.user || ""
+        const p = params.pass || ""
         return (u === api.getConfig('apiUser') && p === api.getConfig('apiPass'))
+    }
+
+    // ------ 值大小限制 ------
+    function valueSize(val) {
+        if (typeof val === 'string') return Buffer.byteLength(val)
+        try { return Buffer.byteLength(JSON.stringify(val)) } catch { return 0 }
+    }
+
+    function parseValue(raw) {
+        if (typeof raw !== 'string') return raw
+        try { return JSON.parse(raw) } catch { return raw }
+    }
+
+    // ------ 設定 dot-path ------
+    const FORBIDDEN_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
+
+    function applySet(data, key, val) {
+        const parts = String(key).split('.')
+        if (parts.some(p => FORBIDDEN_KEYS.has(p)))
+            throw new Error('forbidden key')
+        let cur = data
+        for (let i = 0; i < parts.length - 1; i++) {
+            const k = parts[i]
+            if (!cur[k] || typeof cur[k] !== 'object') cur[k] = {}
+            cur = cur[k]
+        }
+        cur[parts.pop()] = val
     }
 
     // ------ MIDDLEWARE ------
@@ -444,44 +553,61 @@ exports.init = async api => {
         const prefix = api.Const.API_URI + "jsondb/"
         if (!ctx.path.startsWith(prefix)) return
 
-        // Authentication
-        if (!checkAuth(ctx)) {
-            ctx.status = 403
-            ctx.body = "Forbidden: API credentials required"
-            return ctx.stop()
-        }
-
         const action = ctx.path.slice(prefix.length)
-        const q = ctx.query || {}
 
-        function out(obj) {
+        const out = (obj, status = 200) => {
+            ctx.status = status
             ctx.type = "application/json"
             ctx.body = JSON.stringify(obj)
             return ctx.stop()
         }
 
-        // 新增備份相關 API
-        if (action === "backup") {
-            return await manualBackup(ctx)
-        }
-        
-        if (action === "list-backups") {
-            return await listBackups(ctx)
+        // 只允許不會被瀏覽器快取誤觸的方法
+        if (ctx.method !== 'GET' && ctx.method !== 'POST') {
+            ctx.set('Allow', 'GET, POST')
+            return out({ ok: false, error: "method not allowed" }, 405)
         }
 
-        if (action === "" || action === "list") {
-            return out({ 
-                ok: true, 
-                list: api.getConfig('dbList') || [],
-                backupConfig: {
-                    interval: api.getConfig('backupInterval'),
-                    retentionDays: api.getConfig('backupRetentionDays'),
-                    debugMode: api.getConfig('debugMode')
-                }
+        const params = await getParams(ctx)
+
+        // Authentication
+        if (!checkAuth(params)) {
+            ctx.status = 403
+            ctx.body = "Forbidden: API credentials required"
+            return ctx.stop()
+        }
+
+        // 除錯資訊（需開啟 debugMode；已通過認證）
+        if (action === 'debug' && api.getConfig('debugMode')) {
+            const safeParams = { ...params }
+            if (safeParams.pass !== undefined) safeParams.pass = '***'
+            const safeQuery = { ...(ctx.query || {}) }
+            if (safeQuery.pass !== undefined) safeQuery.pass = '***'
+            return out({
+                ok: true,
+                method: ctx.method,
+                query: safeQuery,
+                hasRequestBody: !!(ctx.request && ctx.request.body),
+                hasStateParams: !!(ctx.state && ctx.state.params),
+                stateParamsPreview: JSON.stringify((ctx.state && ctx.state.params) || null).slice(0, 300),
+                reqComplete: !!(ctx.req && ctx.req.complete),
+                readableEnded: !!(ctx.req && ctx.req.readableEnded),
+                paramsKeys: Object.keys(safeParams),
+                paramsPreview: JSON.stringify(safeParams).slice(0, 300)
             })
         }
 
-        if (action === "info") {
+        if (action === "backup") {
+            await manualBackup(ctx, params)
+            return ctx.stop()
+        }
+
+        if (action === "list-backups") {
+            await listBackups(ctx, params)
+            return ctx.stop()
+        }
+
+        if (action === "" || action === "list" || action === "info") {
             return out({
                 ok: true,
                 list: api.getConfig('dbList') || [],
@@ -493,8 +619,8 @@ exports.init = async api => {
             })
         }
 
-        const db = q.db
-        const key = q.key
+        const db = params.db
+        const key = params.key
 
         if (!db || !DB[db])
             return out({ ok: false, error: "db not found" })
@@ -505,44 +631,98 @@ exports.init = async api => {
             return out({ ok: true, db, data: ent.data })
         }
 
+        if (action === "keys") {
+            const prefix2 = params.prefix || ''
+            const keys = Object.keys(ent.data || {}).filter(k => k.startsWith(prefix2))
+            return out({ ok: true, keys, count: keys.length })
+        }
+
         if (action === "get") {
             if (!key) return out({ ok: true, data: ent.data })
-            const val = key.split('.').reduce((o, k) => o?.[k], ent.data)
+            const val = String(key).split('.').reduce((o, k) => o?.[k], ent.data)
             return out({ ok: true, value: val })
         }
 
         if (action === "set") {
             if (!key) return out({ ok: false, error: "missing key" })
-            let val = q.value
-            try { val = JSON.parse(val) } catch {}
+            if (params.value === undefined) return out({ ok: false, error: "missing value" })
 
-            const parts = key.split('.')
-            let cur = ent.data
-            for (let i = 0; i < parts.length - 1; i++) {
-                if (typeof cur[parts[i]] !== "object") cur[parts[i]] = {}
-                cur = cur[parts[i]]
+            const val = parseValue(params.value)
+            const max = Number(api.getConfig('maxValueBytes')) || 0
+            const size = valueSize(val)
+            if (max > 0 && size > max)
+                return out({ ok: false, error: `value too large (${size} > ${max} bytes)` }, 413)
+
+            try {
+                applySet(ent.data, key, val)
+            } catch (e) {
+                return out({ ok: false, error: e.message }, 400)
             }
-            cur[parts.pop()] = val
-
             await saveDB(db)
-            debugLog(`set key ${key} in database ${db}`)
-            return out({ ok: true })
+            debugLog(`set key ${key} in database ${db} (${size} bytes)`)
+            return out({ ok: true, size })
+        }
+
+        if (action === "mset") {
+            let items = params.items
+            if (typeof items === 'string') {
+                try { items = JSON.parse(items) } catch { return out({ ok: false, error: "items must be valid JSON" }) }
+            }
+
+            const pairs = []
+            if (Array.isArray(items)) {
+                for (const it of items) {
+                    if (it && it.key !== undefined) pairs.push([it.key, it.value])
+                }
+            } else if (items && typeof items === 'object') {
+                for (const [k, v] of Object.entries(items)) pairs.push([k, v])
+            }
+
+            if (!pairs.length) return out({ ok: false, error: "no items to write" })
+
+            const max = Number(api.getConfig('maxValueBytes')) || 0
+            let total = 0
+            for (const [k, v] of pairs) {
+                const size = valueSize(v)
+                total += size
+                if (max > 0 && size > max)
+                    return out({ ok: false, error: `value too large for key ${k} (${size} > ${max} bytes)` }, 413)
+            }
+
+            for (const [k, v] of pairs) {
+                try {
+                    applySet(ent.data, k, v)
+                } catch (e) {
+                    return out({ ok: false, error: `${e.message}: ${k}` }, 400)
+                }
+            }
+            await saveDB(db)
+            debugLog(`mset ${pairs.length} keys in database ${db} (${total} bytes)`)
+            return out({ ok: true, count: pairs.length, size: total })
         }
 
         if (action === "del") {
             if (!key) {
+                const allow = api.getConfig('allowClearAll')
+                if (!allow || params.confirm !== 'clear')
+                    return out({ ok: false, error: "missing key (pass confirm=clear to wipe the whole database)" }, 400)
                 ent.data = {}
                 await saveDB(db)
                 debugLog(`cleared entire database ${db}`)
                 return out({ ok: true, cleared: true })
             }
-            const parts = key.split('.')
+
+            const parts = String(key).split('.')
+            if (parts.some(p => FORBIDDEN_KEYS.has(p)))
+                return out({ ok: false, error: "forbidden key" }, 400)
             let cur = ent.data
             for (let i = 0; i < parts.length - 1; i++)
                 cur = cur?.[parts[i]]
 
-            if (!cur) return out({ ok: false, error: "key not found" })
-            delete cur[parts.pop()]
+            if (!cur || typeof cur !== 'object') return out({ ok: false, error: "key not found" })
+            const last = parts.pop()
+            if (!(last in cur)) return out({ ok: false, error: "key not found" })
+            delete cur[last]
             await saveDB(db)
             debugLog(`deleted key ${key} from database ${db}`)
             return out({ ok: true })
